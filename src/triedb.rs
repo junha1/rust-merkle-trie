@@ -16,10 +16,12 @@
 
 use crate::nibbleslice::NibbleSlice;
 use crate::node::Node as RlpNode;
-use crate::{Trie, TrieError};
+use crate::proof::{CryptoProofMerkleTrie, CryptoProofUnit, CryptoStructure, ProofCreation};
+use crate::{Node, Trie, TrieError};
 use ccrypto::{blake256, BLAKE_NULL_RLP};
 use cdb::HashDB;
 use lru_cache::LruCache;
+use primitives::Bytes;
 use primitives::H256;
 use std::cell::RefCell;
 
@@ -144,6 +146,57 @@ impl<'db> Trie for TrieDB<'db> {
 
     fn is_complete(&self) -> bool {
         *self.root == BLAKE_NULL_RLP || self.is_complete_aux(self.root)
+    }
+}
+
+impl<'db> CryptoStructure<H256, H256, Bytes> for TrieDB<'db> {
+    fn make_proof<'k>(&self, key: &'k H256) -> crate::Result<ProofCreation<H256, H256, Bytes>> {
+        type Unit = CryptoProofUnit<H256, H256, Bytes>;
+
+        fn make_proof_upto<'k>(
+            db: &'k dyn HashDB,
+            path: &'k NibbleSlice<'_>,
+            hash: &'k H256,
+        ) -> crate::Result<(Option<Bytes>, Vec<Bytes>)> {
+            let node_rlp = db.get(&hash).ok_or_else(|| TrieError::IncompleteDatabase(*hash))?;
+
+            match Node::decoded(&node_rlp) {
+                Some(Node::Leaf(partial, value)) => {
+                    if &partial == path {
+                        Ok((Some(value.to_vec()), vec![node_rlp]))
+                    } else {
+                        Ok((None, vec![node_rlp]))
+                    }
+                }
+                Some(Node::Branch(partial, children)) => {
+                    if path.starts_with(&partial) {
+                        let left_path = path.mid(partial.len() + 1);
+                        match children[path.mid(partial.len()).at(0) as usize] {
+                            Some(x) => {
+                                let r = make_proof_upto(db, &left_path, &x)?;
+                                Ok((r.0, [vec![node_rlp], r.1].concat()))
+                            }
+                            None => Ok((None, vec![node_rlp])),
+                        }
+                    } else {
+                        Ok((None, Vec::new()))
+                    }
+                }
+                None => Ok((None, Vec::new())), // empty trie
+            }
+        }
+        let x = make_proof_upto(self.db, &NibbleSlice::new(&key), self.root())?;
+
+        let value: Option<Bytes> = x.0.map(|x| x.to_vec());
+        let unit = Unit {
+            hash: *self.root(),
+            key: *key,
+            value,
+        };
+        let provable = CryptoProofMerkleTrie {
+            proof: x.1,
+        };
+        Ok((unit, Box::new(provable)))
     }
 }
 
